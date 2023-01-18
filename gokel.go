@@ -1,9 +1,7 @@
 package gokel
 
 import (
-	"errors"
 	"fmt"
-	"html"
 	"strconv"
 	"strings"
 	"time"
@@ -38,6 +36,12 @@ const (
 	CategoryFF
 )
 
+const (
+	PartPreface = iota
+	PartStats
+	PartChapters
+)
+
 const defaultWorkURL = "https://archiveofourown.org/works/%s?view_adult=true&view_full_work=true"
 
 type WorkStats struct {
@@ -64,6 +68,7 @@ type WorkMeta struct {
 }
 
 type WorkChapter struct {
+	ChapterIndex          int
 	ChapterTitle          string
 	ChapterSummary        string
 	ChapterBeginningNotes string
@@ -85,6 +90,13 @@ type Work struct {
 	WorkChapters []WorkChapter
 	WorkMeta
 	WorkPreface
+}
+
+type Log struct {
+	WorkId   string
+	WorkPart int
+	Payload  string
+	Severity int
 }
 
 var collector *colly.Collector
@@ -110,7 +122,7 @@ func ParseChapterString(chapterString string) (chapters int, maxChapters int, er
 
 	chapters, err = strconv.Atoi(splitStr[0])
 	if err != nil {
-		return 0, 0, errors.New("could not convert chapter number")
+		return 0, 0, err
 	}
 
 	maxChapters, err = strconv.Atoi(splitStr[1])
@@ -118,7 +130,7 @@ func ParseChapterString(chapterString string) (chapters int, maxChapters int, er
 		if splitStr[1] == "?" {
 			maxChapters = -1
 		} else {
-			return 0, 0, errors.New("could not convert max chapter number")
+			return 0, 0, err
 		}
 	}
 
@@ -176,8 +188,10 @@ func GetCategoryConstant(categoryString string) (category int) {
 	}
 }
 
-func GetWork(workID string) (w Work, err error) {
-	initCollector()
+func GetWork(workID string) (w Work, warns []Log, err error) {
+	if collector == nil {
+		initCollector()
+	}
 
 	w = Work{
 		WorkURL: GetWorkURL(workID),
@@ -188,10 +202,10 @@ func GetWork(workID string) (w Work, err error) {
 		if h.DOM.HasClass("afterword") { // Is an afterword note
 			workEndingNotes, err := h.DOM.ChildrenFiltered("div#work_endnotes").Children().Not("h3").Html()
 			if err != nil {
-				panic(err)
+				panic(fmt.Sprintf("Failed to get the end notes, %v", err))
 			}
 
-			w.WorkEndingNotes = strings.TrimSpace(html.UnescapeString(workEndingNotes))
+			w.WorkEndingNotes = strings.TrimSpace(workEndingNotes)
 		} else {
 			w.WorkTitle = strings.TrimSpace(h.DOM.ChildrenFiltered("h2").Text())
 
@@ -201,22 +215,22 @@ func GetWork(workID string) (w Work, err error) {
 
 			workSummary, err := h.DOM.ChildrenFiltered("div.summary").Children().Not("h3").Html()
 			if err != nil {
-				panic(err)
+				panic(fmt.Sprintf("Failed to get summary, %v", err))
 			}
-			w.WorkSummary = strings.TrimSpace(html.UnescapeString(workSummary))
+			w.WorkSummary = strings.TrimSpace(workSummary)
 
 			workBeginningNotes, err := h.DOM.ChildrenFiltered("div.notes").Children().Not("h3").Not("p.jump").Html()
 			if err != nil {
-				panic(err)
+				panic(fmt.Sprintf("Failed to get the beginning notes, %v", err))
 			}
-			w.WorkBeginningNotes = strings.TrimSpace(html.UnescapeString(workBeginningNotes))
+			w.WorkBeginningNotes = strings.TrimSpace(workBeginningNotes)
 		}
 	})
 	defer collector.OnHTMLDetach("div#inner div#workskin > div.preface.group")
 
-	// Collect skinword
+	// Collect skinwork
 	collector.OnHTML("div#inner style", func(h *colly.HTMLElement) {
-		w.WorkSkin = strings.TrimSpace(html.UnescapeString(h.Text))
+		w.WorkSkin = strings.TrimSpace(h.Text)
 	})
 	defer collector.OnHTMLDetach("div#inner style")
 
@@ -263,46 +277,125 @@ func GetWork(workID string) (w Work, err error) {
 			case "words":
 				ret, err := strconv.Atoi(h.Text)
 				if err != nil {
-					panic(err)
+					panic(fmt.Sprintf("Failed to get word stats, %v", err))
 				}
 				w.WorkStats.Words = ret
 			case "chapters":
 				chapters, maxChapters, err := ParseChapterString(strings.TrimSpace(h.Text))
 				if err != nil {
-					panic(err)
+					panic(fmt.Sprintf("Failed to get chapter stats, %v", err))
 				}
 				w.WorkStats.CurrentChapters = chapters
 				w.WorkStats.MaxChapters = maxChapters
 			case "kudos":
 				kudos, err := strconv.Atoi(strings.TrimSpace(h.Text))
 				if err != nil {
-					panic(err)
+					panic(fmt.Sprintf("Failed to get kudos stats, %v", err))
 				}
 				w.WorkStats.Kudos = kudos
 			case "bookmarks":
 				bookmarks, err := strconv.Atoi(strings.TrimSpace(h.Text))
 				if err != nil {
-					panic(err)
+					panic(fmt.Sprintf("Failed to get bookmark stats, %v", err))
 				}
 				w.WorkStats.Bookmarks = bookmarks
 			case "hits":
 				hits, err := strconv.Atoi(strings.TrimSpace(h.Text))
 				if err != nil {
-					panic(err)
+					panic(fmt.Sprintf("Failed to get hit stats, %v", err))
 				}
 				w.WorkStats.Hits = hits
+			case "series", "stats", "comments":
+				// Do nothing
 			default:
-				fmt.Printf("Found unhandled meta with tag: %s\n", dataClass)
+				warns = append(warns, Log{
+					WorkId:   workID,
+					WorkPart: PartPreface,
+					Payload:  fmt.Sprintf("Found an unhandled dataClass with name %s", dataClass),
+				})
 			}
-
 		})
 	})
 	defer collector.OnHTMLDetach("div#inner dl.work.meta")
 
+	// Collect chapters
+	collector.OnHTML("div#inner div#chapters", func(h *colly.HTMLElement) {
+		h.DOM.Children().Each(func(_ int, s *goquery.Selection) {
+			elId := s.AttrOr("id", "")
+			if !strings.HasPrefix(elId, "chapter") {
+				return
+			}
+			chapId, err := strconv.Atoi(strings.TrimSpace(elId[8:]))
+			if err != nil {
+				panic(fmt.Sprintf("Unable to convert chapter index to number, %v", err))
+			}
+
+			workChapter := WorkChapter{
+				ChapterIndex: chapId,
+			}
+
+			s.Children().Each(func(_ int, s *goquery.Selection) {
+				if s.Is(".chapter.preface.group[role=\"complementary\"]") { // Beginning notes div & title
+					chapTitle := strings.TrimSpace(s.ChildrenFiltered(".title").First().Clone().Children().Remove().End().Text())
+					if strings.HasPrefix(chapTitle, ": ") {
+						chapTitle = chapTitle[2:]
+					} else if len(chapTitle) > 0 {
+						warns = append(warns, Log{
+							WorkId:   workID,
+							WorkPart: PartPreface,
+							Payload:  fmt.Sprintf("Chapter title contains unexpected prefix, %s", chapTitle),
+						})
+					}
+
+					chapNotes, err := s.Find("div.summary > blockquote.userstuff").Html()
+					if err != nil {
+						panic(fmt.Sprintf("Unable to get chapter-%d notes, %v", chapId, err))
+					}
+					chapNotes = strings.TrimSpace(chapNotes)
+
+					chapSummary, err := s.Find("div.notes > blockquote.userstuff").Html()
+					if err != nil {
+						panic(fmt.Sprintf("Unable to get chapter-%d summary, %v", chapId, err))
+					}
+					chapSummary = strings.TrimSpace(chapSummary)
+
+					workChapter.ChapterTitle = chapTitle
+					workChapter.ChapterBeginningNotes = chapNotes
+					workChapter.ChapterSummary = chapSummary
+				} else if s.Is(".userstuff.module") { // Content
+					chapterContent, err := s.ChildrenFiltered(".landmark").Remove().End().Html()
+					if err != nil {
+						panic(fmt.Sprintf("Unable to get chapter-%d content, %v", chapId, err))
+					}
+					chapterContent = strings.TrimSpace(chapterContent)
+
+					workChapter.ChapterContent = chapterContent
+				} else if s.Is(".chapter.preface.group:not([role])") { // Ending notes
+					chapterEndNotes, err := s.Find("blockquote").Html()
+					if err != nil {
+						panic(fmt.Sprintf("Unable to get chapter-%d end notes, %v", chapId, err))
+					}
+					chapterEndNotes = strings.TrimSpace(chapterEndNotes)
+
+					workChapter.ChapterEndingNotes = chapterEndNotes
+				} else {
+					warns = append(warns, Log{
+						WorkId:   workID,
+						WorkPart: PartChapters,
+						Payload:  fmt.Sprintf("Found an unhandleble element in chapter div, class: %s", s.AttrOr("class", "")),
+					})
+				}
+			})
+
+			w.WorkChapters = append(w.WorkChapters, workChapter)
+		})
+	})
+	defer collector.OnHTMLDetach("div#inner div#chapters")
+
 	err = collector.Visit(w.WorkURL)
 	if err != nil {
-		return w, err
+		return w, warns, err
 	}
 
-	return w, nil
+	return w, warns, nil
 }
